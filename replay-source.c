@@ -9,6 +9,7 @@
 #include <obs-frontend-api.h>
 #include <obs-scene.h>
 #include "replay.h"
+#include <inttypes.h>
 #include <string.h>
 
 #define VISIBILITY_ACTION_RESTART 0
@@ -91,6 +92,8 @@ struct replay_source {
 	obs_hotkey_id disable_next_scene_hotkey;
 	obs_hotkey_id next_scene_current_hotkey;
 	obs_hotkey_id next_scene_hotkey;
+	obs_hotkey_id next_frame_hotkey;
+	obs_hotkey_id prev_frame_hotkey;
 	uint64_t start_timestamp;
 	uint64_t previous_frame_timestamp;
 	uint64_t pause_timestamp;
@@ -105,6 +108,7 @@ struct replay_source {
 	bool restart;
 	bool active;
 	bool end;
+	bool stepped;
 	enum saving_status saving_status;
 
 	int replay_position;
@@ -551,23 +555,13 @@ static void replay_update_position(struct replay_source *context, bool lock)
 	context->start_timestamp = obs_get_video_frame_time();
 	context->backward = context->backward_start;
 	if (!context->backward && context->current_replay.trim_front != 0) {
-		if (context->speed_percent == 100.0f) {
-			context->start_timestamp -=
-				context->current_replay.trim_front;
-		} else {
-			context->start_timestamp -=
-				(uint64_t)(context->current_replay.trim_front *
-					   100.0 / context->speed_percent);
-		}
+		context->start_timestamp -=
+			(uint64_t)(context->current_replay.trim_front *
+					100.0 / context->speed_percent);
 	} else if (context->backward && context->current_replay.trim_end != 0) {
-		if (context->speed_percent == 100.0f) {
-			context->start_timestamp -=
-				context->current_replay.trim_end;
-		} else {
-			context->start_timestamp -=
-				(uint64_t)(context->current_replay.trim_end *
-					   100.0 / context->speed_percent);
-		}
+		context->start_timestamp -=
+			(uint64_t)(context->current_replay.trim_end *
+					100.0 / context->speed_percent);
 	}
 	context->pause_timestamp = 0;
 	if (context->backward && context->current_replay.video_frame_count) {
@@ -585,7 +579,8 @@ static void replay_update_position(struct replay_source *context, bool lock)
 			context->play = false;
 			obs_source_signal(context->source, "media_pause");
 		}
-		context->pause_timestamp = obs_get_video_frame_time();
+		// What is this for?
+		// context->pause_timestamp = obs_get_video_frame_time();
 	}
 
 	pthread_mutex_unlock(&context->audio_mutex);
@@ -1313,6 +1308,40 @@ static void replay_retrieve(struct replay_source *context)
 	}
 }
 
+// Finds closest frame in the current replay given a desired timestamp.
+uint64_t find_closest_frame(void *data, uint64_t ts, bool le) {
+	struct replay_source *c = data;
+	int64_t count = c->current_replay.video_frame_count;
+	struct obs_source_frame **frames = c->current_replay.video_frames;
+	if (ts < c->current_replay.first_frame_timestamp) {
+		return 0;
+	} else if (ts > c->current_replay.last_frame_timestamp) {
+		return count - 1;
+	}
+
+	uint64_t i = 0, mid = 0, j = count;
+	while (i < j) {
+		mid = (i + j) / 2;
+		if (frames[mid]->timestamp == ts) {
+			return mid;
+		} else  if (frames[mid]->timestamp > ts) {
+			if (mid > 0 && frames[mid-1]->timestamp < ts) {
+				return le ? mid - 1 : mid;
+			}
+			j = mid;
+		} else if (frames[mid]->timestamp < ts) {
+			if (mid < count - 1 && frames[mid+1]->timestamp > ts) {
+				return le ? mid : mid + 1;
+			}
+			i = mid + 1;
+		}
+	}
+	if (i == mid + 1) {
+		return le ? mid : mid + 1;
+	}
+	return le ? mid - 1 : mid;
+}
+
 static void replay_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey,
 			  bool pressed)
 {
@@ -1459,6 +1488,61 @@ static void replay_next_scene_hotkey(void *data, obs_hotkey_id id,
 			obs_source_release(s);
 		}
 	}
+}
+
+void replay_step_frames(void *data, bool pressed, bool forward, uint64_t num_frames) {
+	struct replay_source *c = data;
+	if (c->current_replay.video_frame_count && pressed) {
+		uint64_t next_pos = c->video_frame_position;
+		if (forward) {
+			// Check for wrap at end
+			if (next_pos + num_frames >= c->current_replay.video_frame_count ||
+				c->current_replay.video_frames[next_pos + num_frames]->timestamp >
+				c->current_replay.last_frame_timestamp - c->current_replay.trim_end) {
+				next_pos = find_closest_frame(c, c->current_replay.first_frame_timestamp + c->current_replay.trim_front, false);
+			} else {
+				next_pos += num_frames;
+			}
+
+		} else {
+			// Check for wrap at beginning
+			if (c->video_frame_position < num_frames ||
+			    c->current_replay.video_frames[c->video_frame_position - num_frames]->timestamp <
+				c->current_replay.first_frame_timestamp + c->current_replay.trim_front) {
+				next_pos = find_closest_frame(c, c->current_replay.last_frame_timestamp - c->current_replay.trim_end, true);
+			} else {
+				next_pos -= num_frames;
+			}
+		}
+		if (c->play) {
+			c->play = false;
+			c->pause_timestamp = obs_get_video_frame_time();
+			obs_source_signal(c->source, "media_pause");
+
+		}
+		c->stepped = true;
+		int64_t prev_time = c->current_replay.video_frames[next_pos]->timestamp;
+		int64_t next_time =  c->current_replay.video_frames[c->video_frame_position]->timestamp;
+		int64_t time_diff = (int64_t)((next_time - prev_time) * 100 / c->speed_percent);
+		c->start_timestamp += time_diff;
+		c->video_frame_position = next_pos;
+	}
+}
+
+static void replay_next_frame_hotkey(void *data, obs_hotkey_id id,
+			       obs_hotkey_t *hotkey, bool pressed)
+{
+	UNUSED_PARAMETER(id);
+	UNUSED_PARAMETER(hotkey);
+	replay_step_frames(data, pressed, true, 1);
+}
+
+static void replay_prev_frame_hotkey(void *data, obs_hotkey_id id,
+			       obs_hotkey_t *hotkey, bool pressed)
+{
+	UNUSED_PARAMETER(id);
+	UNUSED_PARAMETER(hotkey);
+	replay_step_frames(data, pressed, false, 1);
 }
 
 static void replay_next_hotkey(void *data, obs_hotkey_id id,
@@ -1801,28 +1885,7 @@ static void replay_trim_front_hotkey(void *data, obs_hotkey_id id,
 	if (!pressed)
 		return;
 
-	const uint64_t timestamp = c->pause_timestamp == 0
-				     ? obs_get_video_frame_time()
-				     : c->pause_timestamp;
-	int64_t duration = timestamp - c->start_timestamp;
-	if (c->speed_percent != 100.0f) {
-		duration = (int64_t)(duration * c->speed_percent / 100.0);
-	}
-	if (c->backward) {
-		duration = (c->current_replay.last_frame_timestamp -
-			    c->current_replay.first_frame_timestamp) -
-			   duration;
-	}
-	if (duration + c->current_replay.first_frame_timestamp <
-	    c->current_replay.last_frame_timestamp -
-		    c->current_replay.trim_end) {
-		c->current_replay.trim_front = duration;
-		struct replay *r = circlebuf_data(
-			&c->replays,
-			c->replay_position * sizeof c->current_replay);
-		if (r)
-			r->trim_front = duration;
-	}
+	c->current_replay.trim_front = c->current_replay.video_frames[c->video_frame_position]->timestamp - c->current_replay.first_frame_timestamp;
 }
 
 static void replay_trim_end_hotkey(void *data, obs_hotkey_id id,
@@ -1836,30 +1899,7 @@ static void replay_trim_end_hotkey(void *data, obs_hotkey_id id,
 	if (!pressed)
 		return;
 
-	const uint64_t timestamp = c->pause_timestamp == 0
-		? obs_get_video_frame_time() : c->pause_timestamp;
-	if (timestamp > c->start_timestamp) {
-		int64_t duration = timestamp - c->start_timestamp;
-		if (c->speed_percent != 100.0f) {
-			duration =
-				(int64_t)(duration * c->speed_percent / 100.0);
-		}
-		if (!c->backward) {
-			duration = (c->current_replay.last_frame_timestamp -
-				    c->current_replay.first_frame_timestamp) -
-				   duration;
-		}
-		if (c->current_replay.first_frame_timestamp +
-			    c->current_replay.trim_front <
-		    c->current_replay.last_frame_timestamp - duration) {
-			c->current_replay.trim_end = duration;
-			struct replay *r = circlebuf_data(
-				&c->replays,
-				c->replay_position * sizeof c->current_replay);
-			if (r)
-				r->trim_end = duration;
-		}
-	}
+	c->current_replay.trim_end = c->current_replay.last_frame_timestamp - c->current_replay.video_frames[c->video_frame_position]->timestamp;
 }
 
 static void replay_trim_reset_hotkey(void *data, obs_hotkey_id id,
@@ -1996,6 +2036,10 @@ static void replay_source_update(void *data, obs_data_t *settings)
 							 true);
 		} else if (strcmp(execute_action, "SwitchToNextScene") == 0) {
 			replay_next_scene_hotkey(context, 0, NULL, true);
+		} else if (strcmp(execute_action, "NextFrame") == 0) {
+			replay_next_frame_hotkey(context, 0, NULL, true);
+		} else if (strcmp(execute_action, "PrevFrame") == 0) {
+			replay_prev_frame_hotkey(context, 0, NULL, true);
 		}
 		obs_data_erase(settings, SETTING_EXECUTE_ACTION);
 	}
@@ -2488,6 +2532,16 @@ static void *replay_source_create(obs_data_t *settings, obs_source_t *source)
 		obs_hotkey_register_source(source, "ReplaySource.NextScene",
 					   obs_module_text("SwitchToNextScene"),
 					   replay_next_scene_hotkey, context);
+	
+	context->prev_frame_hotkey =
+		obs_hotkey_register_source(source, "ReplaySource.PrevFrame",
+		obs_module_text("PrevFrame"),
+		replay_prev_frame_hotkey, context);
+
+	context->next_frame_hotkey =
+		obs_hotkey_register_source(source, "ReplaySource.NextFrame",
+		obs_module_text("NextFrame"),
+		replay_next_frame_hotkey, context);
 
 	return context;
 }
@@ -2900,6 +2954,17 @@ static void replay_source_tick(void *data, float seconds)
 			obs_source_output_video(context->source, f);
 			obs_source_frame_destroy(f);
 		}
+		if (context->stepped) {
+			context->stepped = false;
+			struct obs_source_frame *frame =
+				context->current_replay
+					.video_frames[context->video_frame_position];
+			uint64_t t = frame->timestamp;
+			frame->timestamp = os_timestamp;
+			obs_source_output_video(context->source, frame);
+			frame->timestamp = t;
+			replay_update_text(context);
+		}
 		pthread_mutex_unlock(&context->video_mutex);
 		return;
 	}
@@ -2911,9 +2976,10 @@ static void replay_source_tick(void *data, float seconds)
 
 	if (context->current_replay.video_frame_count) {
 		if (context->video_frame_position >=
-		    context->current_replay.video_frame_count)
+		    context->current_replay.video_frame_count) {
 			context->video_frame_position =
 				context->current_replay.video_frame_count - 1;
+		}
 		struct obs_source_frame *frame =
 			context->current_replay
 				.video_frames[context->video_frame_position];
@@ -2929,17 +2995,11 @@ static void replay_source_tick(void *data, float seconds)
 				context->start_timestamp = os_timestamp;
 				context->restart = false;
 				if (context->current_replay.trim_end != 0) {
-					if (context->speed_percent == 100.0f) {
-						context->start_timestamp -=
-							context->current_replay
-								.trim_end;
-					} else {
-						context->start_timestamp -=
-							(uint64_t)(context->current_replay
-									   .trim_end *
-								   100.0 /
-								   context->speed_percent);
-					}
+					context->start_timestamp -=
+						(uint64_t)(context->current_replay
+									.trim_end *
+								100.0 /
+								context->speed_percent);
 
 					if (context->current_replay.trim_end <
 					    0) {
@@ -2954,21 +3014,10 @@ static void replay_source_tick(void *data, float seconds)
 							&context->video_mutex);
 						return;
 					}
-					while (frame->timestamp >
-					       context->current_replay
-							       .last_frame_timestamp -
-						       context->current_replay
-							       .trim_end) {
-						if (context->video_frame_position ==
-						    0) {
-							context->video_frame_position =
-								context->current_replay
-									.video_frame_count;
-						}
-						context->video_frame_position--;
-						frame = context->current_replay.video_frames
-								[context->video_frame_position];
-					}
+					uint64_t desired_ts = context->current_replay.last_frame_timestamp - context->current_replay.trim_end;
+					int64_t desired_frame_num = find_closest_frame(context, desired_ts, true);
+					frame = context->current_replay.video_frames
+							[desired_frame_num];
 				}
 			}
 
@@ -2982,7 +3031,7 @@ static void replay_source_tick(void *data, float seconds)
 					   frame->timestamp) *
 					  100.0 / context->speed_percent);
 
-			struct obs_source_frame *output_frame = NULL;
+			struct obs_source_frame *output_frame = frame;
 			while (context->play &&
 			       video_duration >= source_duration) {
 				output_frame = frame;
@@ -3009,10 +3058,10 @@ static void replay_source_tick(void *data, float seconds)
 						  100.0 /
 						  context->speed_percent);
 			}
-			if (output_frame) {
-				replay_output_frame(context, output_frame);
-			} else if (context->video_frame_position == 0) {
+			if (context->video_frame_position == 0) {
 				replay_source_end_action(context);
+			} else  {
+				replay_output_frame(context, output_frame);
 			}
 		} else {
 			if (context->restart) {
@@ -3023,17 +3072,11 @@ static void replay_source_tick(void *data, float seconds)
 				frame = context->current_replay.video_frames
 						[context->video_frame_position];
 				if (context->current_replay.trim_front != 0) {
-					if (context->speed_percent == 100.0f) {
-						context->start_timestamp -=
-							context->current_replay
-								.trim_front;
-					} else {
-						context->start_timestamp -=
-							(uint64_t)(context->current_replay
-									   .trim_front *
-								   100.0 /
-								   context->speed_percent);
-					}
+					context->start_timestamp -=
+						(uint64_t)(context->current_replay
+									.trim_front *
+								100.0 /
+								context->speed_percent);
 					if (context->current_replay.trim_front <
 					    0) {
 						uint64_t t = frame->timestamp;
@@ -3047,21 +3090,13 @@ static void replay_source_tick(void *data, float seconds)
 							&context->video_mutex);
 						return;
 					}
-					while (frame->timestamp <
-					       context->current_replay
+					uint64_t desired_ts = context->current_replay
 							       .first_frame_timestamp +
 						       context->current_replay
-							       .trim_front) {
-						context->video_frame_position++;
-						if (context->video_frame_position >=
-						    context->current_replay
-							    .video_frame_count) {
-							context->video_frame_position =
-								0;
-						}
-						frame = context->current_replay.video_frames
-								[context->video_frame_position];
-					}
+							       .trim_front;
+					int64_t desired_frame_num = find_closest_frame(context, desired_ts, false);
+					frame = context->current_replay.video_frames
+							[desired_frame_num];
 				}
 			}
 			if (context->start_timestamp > os_timestamp) {
@@ -3184,7 +3219,7 @@ static void replay_source_tick(void *data, float seconds)
 					   context->current_replay
 						   .first_frame_timestamp) *
 					  100.0 / context->speed_percent);
-			struct obs_source_frame *output_frame = NULL;
+			struct obs_source_frame *output_frame = frame;
 			while (context->play &&
 			       video_duration >= source_duration) {
 				output_frame = frame;
@@ -3213,9 +3248,7 @@ static void replay_source_tick(void *data, float seconds)
 						  100.0 /
 						  context->speed_percent);
 			}
-			if (output_frame) {
-				replay_output_frame(context, output_frame);
-			} else if (context->video_frame_position >=
+			if (context->video_frame_position >=
 				   context->current_replay.video_frame_count -
 					   1) {
 				context->video_frame_position =
@@ -3223,6 +3256,8 @@ static void replay_source_tick(void *data, float seconds)
 						.video_frame_count -
 					1;
 				replay_source_end_action(context);
+			} else {
+				replay_output_frame(context, output_frame);
 			}
 		}
 	} else if (context->current_replay.audio_frame_count) {
